@@ -1,0 +1,1 @@
+Implement a causal moving-average filter in algorithm.py with solve(data: list[float], window: int) -> list[float]. Reject non-positive window sizes.

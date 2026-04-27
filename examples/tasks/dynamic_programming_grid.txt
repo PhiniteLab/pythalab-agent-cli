@@ -1,0 +1,1 @@
+Implement solve(grid: list[list[int]]) -> int that returns the minimum path sum from top-left to bottom-right moving only right or down.

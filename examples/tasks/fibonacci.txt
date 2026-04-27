@@ -1,0 +1,1 @@
+Implement Fibonacci in algorithm.py with solve(n: int) -> int. Reject negative n with ValueError and use an iterative implementation.
