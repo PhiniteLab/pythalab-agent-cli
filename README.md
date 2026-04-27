@@ -1,8 +1,8 @@
 # pythalab-agent-cli
 
-`pythalab-agent-cli` is a terminal-based, validation-driven local coding agent built around small Ollama models. It is designed for engineers and researchers who want a deterministic, security-bounded code generation loop running entirely on their own machine — no cloud calls, no remote inference, no hidden network traffic.
+A terminal-based, local coding agent that drives a small Ollama model through a tight chat-history loop. The model produces a complete `algorithm.py` inside a single fenced `\`\`\`python\`\`\`` block; the runtime writes it, runs syntax + import + runtime smoke checks, and feeds any failure back into the conversation so the model can self-correct.
 
-The default and only required model is [`qwen3:4b`](https://ollama.com/library/qwen3). Generated code is staged as JSON, validated in a temporary workspace, and only materialized to a real Python file after every gate passes.
+The default and only required model is [`qwen3:4b`](https://ollama.com/library/qwen3). Everything runs on `localhost` — no cloud calls, no API keys, no telemetry.
 
 > Project home: <https://github.com/PhiniteLab/pythalab-agent-cli>
 >
@@ -21,7 +21,7 @@ The default and only required model is [`qwen3:4b`](https://ollama.com/library/q
 7. [Command reference](#command-reference)
 8. [Configuration](#configuration)
 9. [Validation pipeline](#validation-pipeline)
-10. [Security model](#security-model)
+10. [Security boundaries](#security-boundaries)
 11. [Project structure](#project-structure)
 12. [Development](#development)
 13. [Troubleshooting](#troubleshooting)
@@ -32,42 +32,49 @@ The default and only required model is [`qwen3:4b`](https://ollama.com/library/q
 
 ## Highlights
 
-- **Local-first.** All inference happens through Ollama on `localhost`. No third-party API key, no telemetry.
-- **Validation before write.** A staged JSON draft must pass syntax, import, lint, type, runtime, and semantic gates before the runtime overwrites `algorithm.py`.
-- **Small-model discipline.** The runtime supplies the public API (function/class signature, IO envelope) so the model only fills in the body.
-- **Deterministic continuous loop.** The agent regenerates, repairs, and retries with a transparent attempt ledger that detects duplicates and stagnation.
-- **Sandboxed execution.** No `shell=True`, no arbitrary imports, no writes outside the workspace, deny-list for `.env`/`.git`/`.ssh` and similar paths.
-- **Reproducible.** Every prompt, validation result, and reward is stored in an on-disk SQLite memory under `.pythalab-agent/`.
+- **Local-first.** Inference goes through Ollama on `localhost:11434`. No third-party API key, no telemetry.
+- **Direct chat-history loop.** The model is asked, in plain chat, for the complete contents of `algorithm.py`. Each new attempt sees the prior assistant draft and the validator's complaint.
+- **Fast smoke validation.** Three subprocess checks per attempt: `py_compile`, an `importlib` import, and `runpy.run_path(..., run_name="__main__")`. No ruff / pyright / pytest gates inside the loop.
+- **Optional pip-install.** When the import check reports `ModuleNotFoundError`, the runtime can install the missing distribution and re-validate (interactive prompt, or `--auto-install` / `--no-install`).
+- **Allow-listed validation commands.** The subprocess sandbox only runs an explicit allow-list (`python -m py_compile`, `python -I -c`, `pytest -q`, `ruff check`, `ruff format --check`, `pyright`, a couple of `git` reads). No `shell=True`, no `rm`, no `curl`, no `pip` from inside the run.
+- **Conservative single-GPU tuning.** Defaults are aimed at an RTX 3060-class 6 GB card.
+- **Reproducible.** Every attempt's source is snapshotted under `.pythalab-agent/attempts/`.
 
 ## How it works
 
 ```text
-        ┌────────┐    JSON only    ┌───────────────┐   pass    ┌──────────────┐
- user → │ planner│ ───────────────►│ code-unit gen │──────────►│ stage as JSON│
-        └────────┘                 └───────────────┘           └──────┬───────┘
-                                                                      │
-                                                            validate in temp ws
-                                                                      │
-                                          fail ◄──── attempt ledger ──┴── pass ──┐
-                                            │                                    ▼
-                                       repair JSON                       materialize → algorithm.py
-                                       (≤ max_repairs)                          │
-                                            │                              final validation
-                                            └──── max_repairs reached ─────► fresh candidate
+┌──────────┐  fenced ```python``` block  ┌──────────────────┐
+│  qwen3   │ ──────────────────────────► │ extract & write  │
+│  via     │                             │ algorithm.py     │
+│  Ollama  │ ◄──────── feedback ──────── │ syntax → import  │
+└──────────┘                             │     → runtime     │
+                                         └────────┬─────────┘
+                                                  │ pass
+                                                  ▼
+                                            ✓ complete
 ```
 
-The model is asked for **one function or one class at a time**. Its output is parsed into a `CodeUnitDraftResponse` and stored under `.pythalab-agent/staged/`. Only after every validator passes is the code written to `algorithm.py` and validated again.
+1. The user runs `pythalab-agent run "TASK"`.
+2. The runtime resolves the workspace, loads config, and starts (or reuses) a local Ollama service.
+3. A system prompt + the user's task + the current contents of `algorithm.py` are sent to `qwen3:4b` over `/api/chat`.
+4. The model returns one fenced `\`\`\`python\`\`\`` block. The runtime extracts the code and writes it directly to `algorithm.py`.
+5. Three subprocess validators run in order: syntax (`py_compile`), import (`importlib`), runtime (`runpy.run_path("algorithm.py", run_name="__main__")`).
+6. If any validator fails, the runtime appends the assistant draft and a compact validator report to the chat history, then asks the model to retry.
+7. On `ModuleNotFoundError` the runtime can pip-install the missing module(s) and re-run validation.
+8. The loop stops on success, when the attempt budget is reached, or when the user hits `Ctrl+C` (`--until-success` mode).
+
+The model never gets file-write or shell tools. The runtime is the only thing that touches disk or runs subprocesses.
 
 ## Requirements
 
-| Requirement | Minimum                                 | Notes                                                                     |
-| ----------- | --------------------------------------- | ------------------------------------------------------------------------- |
-| Python      | 3.11+                                   | Tested on 3.11 and 3.12.                                                  |
-| Ollama      | 0.3+                                    | <https://ollama.com/download>                                             |
-| Disk        | ~3 GB                                   | `qwen3:4b` weights.                                                       |
-| RAM         | 8 GB                                    | CPU-only inference works but is slow.                                     |
-| GPU         | 6 GB VRAM                               | Defaults are tuned for an RTX 3060-class card (`num_ctx: 4096`, `q8_0`). |
-| Tools       | `git`, `ruff`, `pyright`, `pytest`      | `ruff`, `pyright`, `pytest` are installed via the `dev` extra.            |
+| Component | Minimum                            | Notes                                          |
+| --------- | ---------------------------------- | ---------------------------------------------- |
+| Python    | 3.11                               | Tested on 3.11 and 3.12.                        |
+| Ollama    | 0.3+                               | <https://ollama.com/download>                  |
+| Disk      | ~3 GB                              | `qwen3:4b` weights.                             |
+| RAM       | 8 GB                               | CPU-only inference works but is slow.          |
+| GPU       | 6 GB VRAM                          | Defaults are tuned for an RTX 3060-class card. |
+| Tools     | `git` (always), `ruff`/`pyright`/`pytest` (dev only) | The dev tools are not invoked by `run` itself; they are used by the project's own test suite. |
 
 ## Installation
 
@@ -95,6 +102,14 @@ python3 -m venv .venv
 pip install -e '.[dev]'
 ```
 
+Minimal (no dev tools):
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+```
+
 ### 3. Verify the install
 
 ```bash
@@ -102,13 +117,13 @@ pythalab-agent --help
 pythalab-agent doctor
 ```
 
-`doctor` prints a readiness table covering Python, git, ruff, pyright, pytest, Ollama, and model availability. Every `True` row means the corresponding gate is operational.
+`doctor` prints a readiness table covering Python, git, ruff, pyright, pytest, Ollama, and model availability. Every `True` row means that tool is on `PATH`. The `run` loop only requires `python` and `ollama` (plus `qwen3:4b` pulled). The other rows describe what the project's own test suite needs.
 
 ## Ollama setup
 
 ### Install Ollama
 
-Follow the official instructions at <https://ollama.com/download>. On Linux:
+Follow <https://ollama.com/download>. On Linux:
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
@@ -131,17 +146,17 @@ OLLAMA_KV_CACHE_TYPE=q8_0 \
 ollama serve
 ```
 
+You can skip this step: when `pythalab-agent run` cannot reach a local Ollama daemon, it starts `ollama serve` itself with the same conservative environment and stops it after the run.
+
 Confirm the model is reachable:
 
 ```bash
 pythalab-agent models doctor
 ```
 
-You should see `qwen3:4b: True`. If not, repeat `ollama pull qwen3:4b` and check that `ollama serve` is running on `http://localhost:11434`.
+You should see `qwen3:4b: True`.
 
 ## First run
-
-Initialise a workspace and generate a small algorithm:
 
 ```bash
 mkdir my-workspace && cd my-workspace
@@ -153,15 +168,17 @@ pythalab-agent run "Implement function solve(n: int) -> int that returns the n-t
 
 ```text
 my-workspace/
-├── algorithm.py           # generation target
-├── tests/
-│   └── test_algorithm.py  # only writable in explicit test mode
-├── configs/               # per-workspace overrides (optional)
-├── AGENTS.md              # untrusted-data instruction file
-└── .pythalab-agent/       # staged drafts, attempt snapshots, memory.sqlite
+├── algorithm.py             # generation target (placeholder until first run)
+├── tests/test_algorithm.py  # smoke import test
+├── configs/                 # per-workspace config overrides (optional)
+├── AGENTS.md                # untrusted-data instruction file
+└── .pythalab-agent/
+    ├── attempts/            # per-attempt code snapshots
+    ├── logs/
+    └── memory.sqlite        # task/strategy schema (currently unused at runtime)
 ```
 
-While the agent runs, every milestone is printed (`generate`, `validate`, `repair`, `materialize`, `complete`). The final summary table reports `task_id`, `status`, `total_attempts`, and `primary_failure`.
+While the agent runs, every milestone is printed (`preflight`, `generate`, `validate`, `regenerate`, `complete`). The final summary table reports `task_id`, `status`, `total_attempts`, and `primary_failure` (`SYNTAX`, `IMPORT`, `RUNTIME`, `SEMANTIC`, or `NONE`).
 
 ### Without a live model
 
@@ -171,21 +188,23 @@ A deterministic fake backend is built in for development, demos, and CI:
 pythalab-agent run "Implement stable merge sort" --backend fake
 ```
 
-It exercises the full staged pipeline without touching Ollama.
+It exercises the full direct-generation pipeline without touching Ollama.
 
 ## Command reference
 
 | Command                                      | Purpose                                                                  |
 | -------------------------------------------- | ------------------------------------------------------------------------ |
 | `pythalab-agent init [PATH]`                 | Scaffold a workspace (`algorithm.py`, `tests/`, `.pythalab-agent/`).     |
-| `pythalab-agent run "TASK"`                  | Run the staged generation loop until success or attempt budget.          |
-| `pythalab-agent run "TASK" --max-attempts N` | Override `agent.max_total_attempts`.                                     |
+| `pythalab-agent run "TASK"`                  | Run the direct chat-history loop until success or attempt budget.        |
+| `pythalab-agent run "TASK" --max-attempts N` | Override the per-call attempt budget (default: `direct.max_attempts = 10`). |
 | `pythalab-agent run "TASK" --until-success`  | Foreground continuous mode, interruptible with `Ctrl+C`.                 |
 | `pythalab-agent run --backend fake`          | Use the deterministic fake model.                                        |
-| `pythalab-agent chat`                        | Interactive REPL: type a task, get a staged generation cycle.            |
-| `pythalab-agent validate`                    | Run syntax + import + runtime + semantic validation on the workspace.    |
-| `pythalab-agent review`                      | Read-only validation report (no file changes).                           |
-| `pythalab-agent repair [--task TEXT]`        | Run a single repair pass on the current `algorithm.py`.                  |
+| `pythalab-agent run --auto-install`          | Auto-install missing PyPI packages reported by the import check.         |
+| `pythalab-agent run --no-install`            | Never install; always feed the import error back to the model.           |
+| `pythalab-agent chat`                        | Interactive REPL: type a task, get one full generation cycle, repeat.    |
+| `pythalab-agent validate`                    | Run the validation pipeline (syntax + import + runtime).                 |
+| `pythalab-agent review`                      | Same as `validate`, never changes files; for CI.                         |
+| `pythalab-agent repair [--task TEXT]`        | Shortcut for `run` with a default repair task.                           |
 | `pythalab-agent doctor`                      | Print Python / tool / Ollama readiness table.                            |
 | `pythalab-agent models list`                 | Show configured default and fallback models.                             |
 | `pythalab-agent models doctor`               | Probe Ollama and verify the configured models exist.                     |
@@ -193,6 +212,8 @@ It exercises the full staged pipeline without touching Ollama.
 | `pythalab-agent config doctor`               | Show the resolved target file and default model.                         |
 | `pythalab-agent memory list`                 | List task records stored in `.pythalab-agent/memory.sqlite`.             |
 | `pythalab-agent memory clear --yes`          | Wipe the memory database for the current workspace.                      |
+
+> Note: `memory list` is currently empty after every run. The SQLite schema exists for future task / strategy / reflection persistence; the direct-generation loop in 0.1.0 does not write to it.
 
 Common flags for `run`:
 
@@ -208,98 +229,106 @@ Common flags for `run`:
 
 ## Configuration
 
-Configuration is layered: built-in defaults < `configs/*.yaml` in the workspace < CLI flags. Inspect the merged result with:
+Configuration is layered: built-in defaults < `configs/*.yaml` in the workspace. Inspect the merged result with:
 
 ```bash
 pythalab-agent config show
 ```
 
-The most important keys:
+The keys actually consumed by 0.1.0:
 
 ```yaml
+repo:
+  target_file: algorithm.py            # used by validators and init
+
 agent:
-  max_total_attempts: 25      # hard cap unless --until-success
-  max_repairs: 3              # repair tries per staged candidate
-  max_duplicate_drafts: 2     # abandon candidate after N duplicate digests
-  max_same_failure_streak: 4  # abandon candidate after N identical failures
-  min_score_improvement: 0.01 # required progress between repairs
-  default_backend: ollama
+  continue_until_success: false        # honored by `run`
+
+validation:
+  target_file: algorithm.py            # used by syntax + import + runtime checks
+  import_timeout_sec: 30.0
+  runtime_timeout_sec: 60.0
+  run_runtime_check: true              # set false to skip the __main__ exec
 
 models:
   default_model: qwen3:4b
   fallback_model: qwen3:4b
   base_url: http://localhost:11434
-  default_options:
-    num_ctx: 4096
-    repeat_penalty: 1.05
-    top_p: 0.7
+  profiles:                            # per-role Ollama options
+    direct:
+      think: true                      # streams <think>…</think> chunks live
+      temperature: 0.4
+      top_p: 0.9
+      num_ctx: 16384
+      num_predict: -1
+      keep_alive: 30m
 
-validation:
-  target_file: algorithm.py
-  run_ruff: true
-  run_pyright: true
-  run_pytest: true
-  run_runtime_check: true
-  run_semantic: true
-  semantic_threshold: 0.5
-
-security:
-  workspace_only: true
-  write_allowlist: [algorithm.py]
-  explicit_test_write_allowlist: [tests/test_algorithm.py]
-  deny_write_patterns: ['.env', '.git/**', '.ssh/**', '**/*token*', '**/*secret*']
-  forbidden_code_patterns: ['eval(', 'exec(', 'subprocess', 'socket', 'urllib', 'requests', 'httpx']
+direct:
+  profile_name: direct
+  max_attempts: 10
+  max_history_chars: 24000
+  request_timeout_sec: 600.0
+  save_attempt_snapshots: true
+  error_summary_max_lines: 80
 ```
 
-Drop a `configs/default.yaml` (or `models.yaml`, `validation.yaml`, `security.yaml`) into your workspace to override per-project values.
+Other keys present in the schema (`agent.max_total_attempts`, `validation.run_ruff/run_pyright/run_pytest`, `security.*`, `memory.top_k_*`, etc.) are accepted by the loader but **not consumed** by the 0.1.0 runtime. They reflect the future feature surface; treat them as reservations, not guarantees.
+
+Drop a `configs/default.yaml`, `configs/models.yaml`, `configs/validation.yaml`, or `configs/security.yaml` into your workspace to override per-project values.
 
 ## Validation pipeline
 
-Every staged draft and the final materialized file go through:
+`pythalab-agent validate` and the inner loop both run the same three subprocess checks against `algorithm.py`, in order, stopping on the first failure:
 
-```bash
-python -m py_compile algorithm.py
-python -I -c "import importlib.util; spec=importlib.util.spec_from_file_location('algorithm','algorithm.py'); mod=importlib.util.module_from_spec(spec); assert spec.loader is not None; spec.loader.exec_module(mod)"
-ruff check .
-ruff format --check .
-pyright
-pytest -q
-```
+| # | Check    | Command                                                    | Failure type |
+| - | -------- | ---------------------------------------------------------- | ------------ |
+| 1 | syntax   | `python -m py_compile algorithm.py` (in-process `compile()` is used; the command is reported in the result) | `SYNTAX`  |
+| 2 | import   | `python -I -c "import importlib.util; spec=importlib.util.spec_from_file_location(...); spec.loader.exec_module(mod); print('ok')"` | `IMPORT`  |
+| 3 | runtime  | `python -I -c "import runpy, sys; sys.argv=['algorithm.py']; runpy.run_path('algorithm.py', run_name='__main__')"` | `RUNTIME` |
 
-plus a deterministic semantic checklist tied to the task domain. The runner uses a stable subprocess environment to avoid `__pycache__`, plugin autoload, and parent-process pipe leaks. Optional gates (`ruff`, `pyright`, `pytest`) are skipped when the binaries are missing — install the `dev` extra to enable them.
+The subprocess runner uses a stable environment: `PYTHONDONTWRITEBYTECODE=1`, `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` (when pytest is invoked elsewhere), `PYTHONPATH` extended with the workspace root and the venv's `purelib` / `platlib`, `stdin=DEVNULL`, output captured into temporary files, no shell.
 
-See [docs/validation_pipeline.md](docs/validation_pipeline.md) for the gate-by-gate description and exit-code conventions.
+`runtime_check` can be disabled by setting `validation.run_runtime_check: false`.
 
-## Security model
+The `agent.run` summary line you see in the terminal (`semantic_score=1.00 total_score=1.00 primary_failure=UNKNOWN`) is the report's compact format; `semantic_score` and `total_score` are derived from the pass/fail of the three subprocess checks — the runtime does not run a separate semantic oracle in 0.1.0.
 
-- **Model is data, not control.** The LLM never gets file-write or shell tools. It returns JSON; the runtime validates and applies it.
-- **Path policy.** The initial write allow-list is `algorithm.py` only. `tests/test_algorithm.py` is allowed only in explicit test-generation mode. `.env`, `.git/**`, `.ssh/**`, `pyproject.toml`, `configs/security.yaml`, and any path outside the workspace are denied.
-- **Command policy.** Validation commands are exact/prefix allow-listed. The runtime never uses `shell=True`. Forbidden during runs: `rm`, `curl`, `wget`, `ssh`, `scp`, `sudo`, `chmod`, `chown`, `pip`, `uv`.
-- **Code policy.** Staged code is parsed with the standard library `ast`. Drafts containing `eval`, `exec`, `subprocess`, `socket`, `urllib`, `requests`, `httpx`, top-level executable statements, or hidden global state are rejected before they ever touch the filesystem.
-- **Prompt-injection guard.** Repository-local instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`, comments, tests, logs) are treated as untrusted data and cannot override runtime policy.
-- **No secret persistence.** Memory storage is local SQLite; secrets are never read or written by design.
+See [docs/validation_pipeline.md](docs/validation_pipeline.md) for full details.
 
-Full details: [docs/security_model.md](docs/security_model.md).
+## Security boundaries
+
+What is enforced at runtime:
+
+- **Subprocess command allow-list** ([command_policy.py](src/pythalab_agent_cli/sandbox/command_policy.py)). The validation runner only accepts the allow-listed prefixes (`python -m py_compile`, `python -I -c`, `ruff check`, `ruff format --check`, `pyright`, `pytest -q`, `git diff --`, `git status --short`). Forbidden tokens (`rm`, `curl`, `wget`, `ssh`, `scp`, `sudo`, `chmod`, `chown`, `pip`, `uv`) are rejected. No `shell=True`. No string interpolation into commands.
+- **No model-driven shell or filesystem.** The model returns text. The runtime is the only component that writes files or starts processes.
+- **Workspace-scoped state.** Snapshots, logs, and memory live under `.pythalab-agent/` in the workspace.
+
+What is **not** enforced at runtime in 0.1.0:
+
+- The `security` block in `configs/security.yaml` (`write_allowlist`, `deny_write_patterns`, `forbidden_code_patterns`) is **not** applied to model output. It is part of the future feature surface.
+- Generated code is run as the current user via `runpy.run_path(..., run_name="__main__")`. **Always run the agent in a workspace you trust to execute model output.** Use a throwaway directory, a container, or an unprivileged user.
+- Optional pip-install (`--auto-install`) installs into the active Python environment. Use a virtual environment.
+
+The system prompt asks the model to avoid `eval`, `exec`, network calls, and similar risky patterns; that is a soft contract, not a sandbox. See [docs/security_model.md](docs/security_model.md) for the threat model and what is planned.
 
 ## Project structure
 
 ```text
 pythalab-agent-cli/
 ├── src/pythalab_agent_cli/
-│   ├── agent/        # direct generation loop, observers, results
+│   ├── agent/        # DirectAgentLoop, observer protocol, run-result dataclass
 │   ├── app/          # Typer CLI, command implementations, REPL
-│   ├── config/       # schema, defaults, layered loader
-│   ├── core/         # constants, errors, shared types
-│   ├── llm/          # Ollama client, fake client, code extractor
-│   ├── memory/       # SQLite store and migrations
-│   ├── repo/         # workspace discovery and scaffolding
-│   ├── sandbox/      # local subprocess runner + command policy
-│   ├── ui/           # progress reporting and tables
-│   └── validation/   # syntax, import, runtime, pipeline, report
-├── configs/          # default YAML configuration
-├── docs/             # architecture, agent loop, validation, security, ...
+│   ├── config/       # Pydantic schema, defaults, layered YAML loader
+│   ├── core/         # constants, exceptions, shared enums
+│   ├── llm/          # Ollama HTTP client, fake client, fenced-block extractor, ollama service manager
+│   ├── memory/       # SQLite schema and store (read by `memory list`)
+│   ├── repo/         # workspace discovery and `init` scaffolding
+│   ├── sandbox/      # subprocess runner + command allow-list
+│   ├── ui/           # Rich progress observer + key/value table helper
+│   └── validation/   # syntax / import / runtime checks + report dataclass + pipeline
+├── configs/          # built-in YAML presets shipped with the package
+├── docs/             # architecture, agent loop, validation, security, …
 ├── examples/         # sample tasks and a sample workspace
-├── tests/            # unit, integration, and golden tests
+├── tests/            # unit, integration, and golden tests (34 in total)
 └── pyproject.toml
 ```
 
@@ -314,33 +343,27 @@ pyright
 pytest -q
 ```
 
-The default test suite uses `FakeModelClient` and does not need a live Ollama. Tests marked `ollama` require a running daemon and the model pulled.
-
-To work on the CLI in editable mode:
-
-```bash
-pip install -e '.[dev]'
-pythalab-agent --help
-```
+The default test suite uses `FakeModelClient` and does not need a live Ollama. Tests marked `ollama` require a running daemon and `qwen3:4b` pulled.
 
 ## Troubleshooting
 
 | Symptom                                              | Likely cause / fix                                                                 |
 | ---------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | `pythalab-agent: command not found`                  | Activate the venv: `. .venv/bin/activate`.                                         |
-| `models doctor` shows `ollama_ok: False`             | Start the daemon: `ollama serve`.                                                  |
+| `models doctor` shows `ollama_ok: False`             | Start the daemon: `ollama serve` (or let the CLI start it on `run`).               |
 | `qwen3:4b: False`                                    | Run `ollama pull qwen3:4b`.                                                        |
-| `run` exits with `primary_failure=SECURITY`          | Generated code hit a forbidden import/call. Check `.pythalab-agent/staged/`.       |
-| `run` keeps hitting `max_total_attempts`             | Use `--until-success` or raise `agent.max_total_attempts` in `configs/default.yaml`. |
-| Out-of-memory on GPU                                  | Lower `models.default_options.num_ctx` or use the recommended Ollama env vars.    |
-| `validate` reports `pyright skipped`                 | Install the `dev` extra: `pip install -e '.[dev]'`.                                |
+| `run` exits with `primary_failure=IMPORT`            | The model imported a missing package. Re-run with `--auto-install`, or let the model retry without the import. |
+| `run` exits with `primary_failure=RUNTIME`           | The model's `__main__` block raised. The traceback is fed back; usually the next attempt fixes it. |
+| `run` keeps hitting `direct.max_attempts`            | Use `--until-success` or raise `direct.max_attempts` in `configs/default.yaml`.    |
+| Out-of-memory on GPU                                  | Lower `models.profiles.direct.num_ctx` (default 16384) toward 8192 or 4096.       |
+| `validate` exits non-zero                            | Read the printed `[FAIL]` block; fix `algorithm.py` (or re-run `run`).             |
 
 ## Roadmap
 
-- Multi-file edit mode (off by default).
-- Docker-based sandbox runner with `--network none` and tmpfs.
-- Optional Qwen-Agent adapter for richer tool routing.
-- Configurable semantic-validation oracles per domain.
+- Wire the existing `security`, `validation.run_ruff/run_pyright/run_pytest`, and `agent.max_total_attempts` config keys into the runtime so they are not declarative-only.
+- Persist task / strategy / reflection records into `.pythalab-agent/memory.sqlite` after each run.
+- Optional Docker sandbox runner with `--network none` and tmpfs for the runtime check.
+- Multi-file edit mode behind an explicit flag.
 
 See [docs/development_roadmap.md](docs/development_roadmap.md).
 

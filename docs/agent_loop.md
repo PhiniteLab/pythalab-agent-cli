@@ -1,65 +1,74 @@
-# Agent Loop
+# The agent loop
 
-The runtime loop is deterministic and staged:
+The single entry point for code generation in 0.1.0 is `DirectAgentLoop` in [src/pythalab_agent_cli/agent/direct_loop.py](../src/pythalab_agent_cli/agent/direct_loop.py). It is a flat chat-history loop with no sub-stages, no JSON staging, and no planner/patcher/reviewer roles.
 
-1. Preflight: resolve workspace, load config, initialize memory.
-2. Classify task.
-3. Build compact context: user request, target file, repo map, validation summary, and memory/reflection brief.
-4. Select strategy with epsilon-greedy reward statistics.
-5. Ask planner for JSON `PlanResponse`; no code is written.
-6. Infer `DomainTemplateSpec`, `ComponentSpec`, and `InterfaceSpec` deterministically.
-7. Ask the model for one `CodeUnitDraftResponse` JSON object.
-8. Store the draft JSON under `.pythalab-agent/staged/`.
-9. Validate draft code in a temporary workspace.
-10. If validation fails, record the attempt in `AttemptLedger` and repair the JSON draft only; do not write Python.
-11. Repeat focused repair up to `agent.max_repairs` times for that candidate.
-12. If the candidate is duplicated, repeatedly fails the same gate, or stops improving, abandon it and generate a fresh staged candidate.
-13. Materialize passing code to `algorithm.py` through a path-checked full-file patch.
-14. Run final validation on the real workspace.
-15. If final validation fails, restore the previous `algorithm.py` and continue with a fresh staged candidate.
-16. Stop only after success, attempt-budget exhaustion, security failure, or user interruption.
-17. Store artifacts, validation, reward, reflection, and strategy stats.
+## Inputs
 
-## Repair policy
+`DirectAgentLoop.__init__` takes:
 
-The repair loop is capped at three attempts. Each repair sees the same component specification, the previous staged code unit, compact validation feedback, and relevant reflections. It must preserve the public interface and fix only the primary failure category.
+- `client: LLMClient` — usually `OllamaClient`, sometimes `FakeModelClient`.
+- `pipeline: ValidationPipeline` — wraps the three validators.
+- `workspace: WorkspacePaths` — resolved root, `target_file`, `state_dir`, …
+- `config: AppConfig` — the merged Pydantic config tree.
+- `observer: AgentObserver | None` — Rich progress reporter.
+- `memory_store: SQLiteStore | None` — read-only in 0.1.0.
+- `missing_package_prompt: MissingPackagePrompt | None` — callback that decides whether to pip-install on `ModuleNotFoundError`.
 
-## JSON-before-Python policy
+## Run loop
 
-All model-generated code remains in formatted JSON until staging validation passes. This lets the runtime compare candidates, inspect inputs/outputs, and defer real file writes.
+`DirectAgentLoop.run(task: str, *, max_attempts: int | None, until_success: bool) -> AgentRunResult`:
 
+1. **Preflight.**
+   - Resolve the chat profile (`config.direct.profile_name`, default `"direct"`) from `config.models.profiles`.
+   - Build the initial chat history:
+     - `system` = `_DIRECT_SYSTEM_PROMPT` (asks for one fenced ```` ```python ```` block, no prose, no `eval`/`exec`/network).
+     - `user` = the task plus the current file contents of `target_file` (truncated if huge).
+   - Emit `preflight` milestone.
 
-## Continuous attempt policy
+2. **Attempt loop.** While the attempt counter is below the budget (or forever if `until_success`):
 
-The loop is foreground-continuous: every generate, staged validation, repair, retry,
-materialization, and final validation event is emitted through an `AgentObserver`. The
-Typer CLI uses `RichAgentObserver`, so the user sees what the agent is trying at each
-moment.
+   a. **Generate.**
+      - Emit `generate` milestone.
+      - Call `client.chat_text(messages, options=profile_options, stream_callback=observer.thinking)`.
+      - If `think=True` is set on the profile, NDJSON streaming is used and `<think>…</think>` chunks are forwarded to the observer live.
 
-Default attempt budget:
+   b. **Extract.**
+      - `extract_python_code(text)` (from [llm/code_extractor.py](../src/pythalab_agent_cli/llm/code_extractor.py)) finds the first fenced ```` ```python ```` block, AST-parses it for safety, and returns the source.
+      - If no block is found, the loop appends a short reminder ("respond with one fenced python block, no prose") and continues.
 
-```yaml
-agent:
-  max_total_attempts: 25
-  max_repairs: 3
-  continue_until_success: false
-  max_duplicate_drafts: 2
-  max_same_failure_streak: 4
-  min_score_improvement: 0.01
-```
+   c. **Write.**
+      - The extracted source is written to `workspace.target_file` (default `algorithm.py`).
+      - A snapshot is written to `.pythalab-agent/attempts/task-{id:06d}-attempt-{idx:03d}.py` if `direct.save_attempt_snapshots` is true.
 
-CLI overrides:
+   d. **Validate.**
+      - Emit `validate` milestone.
+      - `pipeline.run(workspace.target_file)` runs syntax → import → runtime, stopping on the first failure.
 
-```bash
-pythalab-agent run "TASK" --max-attempts 50
-pythalab-agent run "TASK" --until-success
-```
+   e. **Decide.**
+      - **Pass:** emit `complete` milestone, return `AgentRunResult(status=COMPLETE, …)`.
+      - **Fail with `IMPORT` and `ModuleNotFoundError: 'X'`:** call `missing_package_prompt(X)`. If approved, run `LocalRunner.run(["python", "-m", "pip", "install", X])`, then re-validate without consuming an attempt.
+      - **Other failures:** append the assistant draft and a compact validator report to the chat history, plus an "actionable directive" tailored to the failure type (e.g. "the import test imports the module by file path; do not put expensive work at module top-level"). Emit `regenerate` milestone, increment the attempt counter, loop.
 
-`--until-success` uses no fixed attempt cap and should be treated as an interactive mode.
+3. **Budget exhausted.** Return `AgentRunResult(status=BUDGET_EXHAUSTED, …)`.
 
-## Attempt ledger
+4. **Ctrl+C in `--until-success`.** A `KeyboardInterrupt` is caught at the CLI layer and reported as `INTERRUPTED`.
 
-`AttemptLedger` stores a digest, primary failure type, validation score, and source
-(`generate`, `repair`, or `final`) for each staged attempt. This gives the runtime a
-non-LLM reliability controller that can stop duplicate or non-improving repairs and
-request a fresh candidate while keeping the terminal user informed.
+## History truncation
+
+`config.direct.max_history_chars` (default `24000`) caps the total number of characters in the chat history. When exceeded, the oldest non-system messages are dropped first. The system message and the most recent user/assistant pair are always preserved.
+
+`config.direct.error_summary_max_lines` (default `80`) caps how many lines of validator output are appended in the feedback turn.
+
+## Why this shape
+
+- **No stages.** A small model like `qwen3:4b` works best when it produces one self-contained file at a time; staging tends to compound errors.
+- **No tools.** The model never gets file-write or shell tools. Every side effect is the runtime's responsibility.
+- **Chat history as memory.** The loop's "memory" is the chat itself. The persistent SQLite store is read-only in 0.1.0; integrating writes is on the roadmap.
+
+## Related files
+
+- [src/pythalab_agent_cli/agent/direct_loop.py](../src/pythalab_agent_cli/agent/direct_loop.py) — the loop.
+- [src/pythalab_agent_cli/agent/observer.py](../src/pythalab_agent_cli/agent/observer.py) — milestone protocol.
+- [src/pythalab_agent_cli/agent/result.py](../src/pythalab_agent_cli/agent/result.py) — return type.
+- [src/pythalab_agent_cli/llm/code_extractor.py](../src/pythalab_agent_cli/llm/code_extractor.py) — fenced-block parser.
+- [src/pythalab_agent_cli/ui/progress.py](../src/pythalab_agent_cli/ui/progress.py) — Rich observer.

@@ -1,89 +1,79 @@
-# Quality Report
+# Quality report — 0.1.0
 
-This report records the validation gates used for the `qwen3:4b` staged-agent runtime.
+This page records the verifiable quality signals for the 0.1.0 release.
 
-## Bytecode-free compile sweep
-
-`ruff` and `pyright` are configured as development dependencies and runtime validation gates. They are skipped automatically when the binaries are not installed; install the `dev` extra to enable them.
-
-Executed checks:
+## Test suite
 
 ```bash
-python - <<'PY'
-from pathlib import Path
-for root in [Path('src'), Path('tests')]:
-    for path in root.rglob('*.py'):
-        compile(path.read_text(encoding='utf-8'), str(path), 'exec')
-PY
+pytest -q
 ```
 
-Observed result:
+- 34 tests across `tests/unit/`, `tests/integration/`, and `tests/golden/`.
+- All tests pass without a live Ollama. Tests that exercise the model use `FakeModelClient` ([llm/fake_client.py](../src/pythalab_agent_cli/llm/fake_client.py)).
+- The integration test `tests/integration/test_continuous_attempt_loop.py` exercises `--until-success` with a fake scenario that fails on the first attempt and succeeds on the second.
 
-```text
-COMPILE_BAD 0
-```
-
-Targeted pytest checks executed with `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`:
+## Lint and types
 
 ```bash
-pytest tests/unit/test_domain_templates.py tests/unit/test_ollama_service.py -q
-pytest tests/unit/test_staged_generation.py -k 'actor_critic or domain_fallbacks or store or enforce' -q
-pytest tests/unit/test_ollama_client.py -q
-pytest tests/unit/test_validation_pipeline.py -q
+ruff check .
+ruff format --check .
+pyright
 ```
 
-Observed results:
+- `ruff check` reports zero issues in `src/`, `tests/`, and `docs/`. The only outstanding hit is a pre-existing `SIM108` in [examples/workspaces/simple_algorithm_project/algorithm.py](../examples/workspaces/simple_algorithm_project/algorithm.py); it is example content and is intentionally left as-is.
+- `ruff format --check .` is clean.
+- `pyright` reports zero errors against [pyrightconfig.json](../pyrightconfig.json).
 
-```text
-7 passed
-9 passed
-6 passed
-5 passed
-```
+## Live `qwen3:4b` smoke run
 
-## Required local checks after `uv sync --extra dev`
-
-Run these in the final local environment:
+A live end-to-end run was performed on a development machine with `ollama` 0.x and `qwen3:4b` on a 6 GB GPU:
 
 ```bash
+mkdir -p real-test/ws && cd real-test/ws
+pythalab-agent init .
+pythalab-agent run "Implement function solve(n: int) -> int returning the n-th Fibonacci number iteratively"
+```
+
+Result: a passing implementation in `algorithm.py` after two attempts. `validate` reported `passed=True`, `total_score=1.0`, and `primary_failure=NONE`. Each attempt's source is preserved in `.pythalab-agent/attempts/`.
+
+The same live run was repeated for:
+
+- `pythalab-agent doctor` — all rows green except those depending on optional tools the host did not have installed.
+- `pythalab-agent models doctor` — `ollama_ok: True`, `qwen3:4b: True`.
+- `pythalab-agent config show` / `config doctor` — produced a YAML dump matching the merged defaults plus the workspace `configs/`.
+- `pythalab-agent validate`, `pythalab-agent review`, `pythalab-agent repair` — exercised against the workspace produced above.
+- `pythalab-agent memory list` — empty (expected, see [memory_and_reward.md](memory_and_reward.md)).
+
+## Known gaps (not regressions)
+
+The following are documented limitations of 0.1.0, not bugs:
+
+- The validation pipeline does not run `ruff`, `pyright`, `pytest`, or any AST-level safety scan. The corresponding `validation.run_*` config keys are inert in 0.1.0.
+- `security.write_allowlist`, `security.deny_write_patterns`, and `security.forbidden_code_patterns` are accepted by the config schema but are not consulted by the runtime.
+- `DirectAgentLoop.run` does not write to the SQLite memory store. `pythalab-agent memory list` is empty after `run`.
+- The `planner`, `patcher`, `code_unit`, `repairer`, `reviewer`, `reflection`, and `json_repair` model profiles in `configs/models.yaml` are reserved for future work; only `direct` is consumed.
+
+See [development_roadmap.md](development_roadmap.md) for the planned remediation order.
+
+## How to reproduce
+
+```bash
+git clone https://github.com/PhiniteLab/pythalab-agent-cli.git
+cd pythalab-agent-cli
+uv sync --extra dev
+. .venv/bin/activate
+
 ruff check .
 ruff format --check .
 pyright
 pytest -q
 ```
 
-## CLI smoke check
-
-The deterministic fake backend was used so the smoke test does not require a live Ollama model. A Q-learning/PyTorch-style request now materializes a standard-library-only, PyTorch-compatible staged fallback after the initial fake model draft fails semantic validation:
+For the live model run, additionally:
 
 ```bash
-PYTHONPATH=src python -m pythalab_agent_cli init /tmp/pythalab-workspace
-PYTHONPATH=src python -m pythalab_agent_cli run \
-  "Write a Q learning code in python pytorch" \
-  --backend fake \
-  --path /tmp/pythalab-workspace \
-  --max-attempts 5
+ollama pull qwen3:4b
+mkdir -p /tmp/pythalab-smoke && cd /tmp/pythalab-smoke
+pythalab-agent init .
+pythalab-agent run "Implement solve(n: int) -> int returning the n-th Fibonacci number iteratively"
 ```
-
-Observed terminal milestones:
-
-```text
-staged_validate fail attempt=0 — SEMANTIC
-fallback_code_unit running attempt=1
-staged_validate pass attempt=1
-materialize running — writing validated staged module template to algorithm.py
-final_validate success — algorithm.py passed final validation
-complete success used=2/5 — algorithm.py written after 2 staged attempt(s)
-```
-
-## Reliability gates added in this iteration
-
-- PlanManifest creation before code generation.
-- Domain templates for AI/ML, RL, nonlinear control, control theory, simulation, visualization, and data import/export.
-- Standard request/result envelope instead of model-invented APIs.
-- Single code-unit generation and staged JSON persistence before Python materialization.
-- Deterministic stdlib-only PyTorch-compatible fallbacks for RL/neural-network requests.
-- Conservative RTX 3060 6 GB Ollama profile: `num_ctx=4096`, short `num_predict`, `think=false`, `keep_alive=30s`.
-- Ollama server env defaults: one parallel request, one loaded model, Flash Attention, and `q8_0` KV cache when supported.
-- Temporary-file subprocess output capture for validation commands.
-- Direct safe materialization after staged validation instead of re-applying a full-file patch.

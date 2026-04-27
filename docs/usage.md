@@ -1,224 +1,134 @@
-# Usage Guide
+# Usage
 
-This guide walks through every command exposed by `pythalab-agent`, with realistic examples and the expected output shape.
+Every CLI command lives under `pythalab-agent`. Run `pythalab-agent --help` for a generated overview, and `pythalab-agent <command> --help` for per-command flags.
 
-All examples assume:
+This page documents what each command actually does in 0.1.0.
 
-```bash
-. .venv/bin/activate
-cd my-workspace
-```
-
-## 1. `pythalab-agent init`
-
-Scaffold a workspace.
+## `init`
 
 ```bash
-pythalab-agent init .
+pythalab-agent init [PATH]
 ```
 
-Creates `algorithm.py`, `tests/test_algorithm.py`, `configs/`, `AGENTS.md`, and the `.pythalab-agent/` runtime directory.
-
-Re-running `init` is safe; it does not overwrite existing files.
-
-## 2. `pythalab-agent run`
-
-The core command. Generates code, validates it staged, repairs, and materializes only when every gate passes.
-
-```bash
-pythalab-agent run "Implement function solve(n: int) -> int that returns the n-th Fibonacci number iteratively"
-```
-
-Typical milestones printed to the terminal:
+Scaffolds a workspace at `PATH` (default: current directory):
 
 ```text
-✓ preflight        — target=algorithm.py model=qwen3:4b max_attempts=25
-✓ generate (#1)    — model returned 412 chars
-✓ validate (#1)    — attempt 1 passed
-✓ complete (1/25)  — algorithm.py validated after 1 attempt(s)
+PATH/
+├── algorithm.py             # placeholder with `def solve(...)`
+├── tests/test_algorithm.py  # smoke import test
+├── configs/
+│   ├── default.yaml
+│   ├── models.yaml
+│   ├── validation.yaml
+│   └── security.yaml
+├── AGENTS.md                # untrusted-data instruction file
+└── .pythalab-agent/
+    ├── attempts/            # populated by `run`
+    ├── logs/
+    └── memory.sqlite        # schema present; no writes in 0.1.0
 ```
 
-Final summary:
+It will not overwrite an existing `algorithm.py`, `tests/test_algorithm.py`, or `AGENTS.md`. Re-running `init` on an existing workspace is safe.
 
-```text
-                         Run result
-┏━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ Key               ┃ Value                                           ┃
-┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-│ task_id           │ 77001                                           │
-│ status            │ success                                         │
-│ changed_files     │ algorithm.py                                    │
-│ attempt_snapshots │ .pythalab-agent/attempts/task-077001-attempt-…  │
-│ total_attempts    │ 1                                               │
-│ max_attempts      │ 25                                              │
-│ primary_failure   │ NONE                                            │
-└───────────────────┴─────────────────────────────────────────────────┘
-```
-
-Useful flags:
+## `run`
 
 ```bash
-pythalab-agent run "TASK" --max-attempts 50         # raise the budget
-pythalab-agent run "TASK" --until-success            # foreground continuous
-pythalab-agent run "TASK" --backend fake             # deterministic, no Ollama
-pythalab-agent run "TASK" --path ./other-workspace   # operate elsewhere
-pythalab-agent run "TASK" --no-install               # never install missing deps
-pythalab-agent run "TASK" --auto-install             # install missing deps automatically
+pythalab-agent run "TASK" [OPTIONS]
 ```
 
-### Writing good tasks
+Runs the direct chat-history generation loop until a validator passes or the attempt budget is exhausted.
 
-The runtime works best with explicit signatures:
+Common options:
 
-```text
-Implement function solve(data: list[int]) -> list[int] that returns a stable merge sort of data.
+| Flag                              | Meaning                                                                 |
+| --------------------------------- | ----------------------------------------------------------------------- |
+| `--backend ollama|fake`           | Choose the LLM client. `fake` is deterministic and offline.             |
+| `--fake-scenario NAME`            | Use a named fake scenario (`default`, `syntax_then_repair`, `no_block_first`). |
+| `--path PATH`                     | Workspace root (default: cwd).                                          |
+| `--max-attempts N`                | Override `direct.max_attempts` for this call. `0` means "use config".   |
+| `--until-success`                 | Foreground continuous mode; runs forever until a pass or `Ctrl+C`.      |
+| `--auto-install`                  | On `ModuleNotFoundError`, auto-install the missing distribution.        |
+| `--no-install`                    | Never install; always feed import errors back to the model.             |
+
+Examples:
+
+```bash
+pythalab-agent run "Implement solve(n) returning the n-th Fibonacci number iteratively"
+
+pythalab-agent run "Implement merge sort as solve(items)" --until-success
+
+pythalab-agent run "Plot a sine wave" --auto-install
+
+pythalab-agent run "Stable sort" --backend fake
 ```
 
-If no signature is given, the runtime supplies the standard envelope:
+The terminal shows live milestones (`preflight`, `generate`, `validate`, `regenerate`, `complete`) and, when the model is configured with `think: true`, streams the model's `<think>…</think>` content. Each attempt's source is snapshotted to `.pythalab-agent/attempts/task-XXXXXX-attempt-YYY.py`.
 
-```python
-def solve(request: dict[str, object]) -> dict[str, object]
-```
+The exit code is `0` on success and `1` if the budget is exhausted without a passing validation.
 
-with `request = {"inputs": ..., "parameters": ..., "config": ..., "metadata": ...}` and `result = {"outputs": ..., "metrics": ..., "artifacts": ..., "diagnostics": ...}`.
-
-## 3. `pythalab-agent chat`
-
-Interactive REPL — type a task per line, press Enter, get a full staged generation cycle, then loop.
+## `chat`
 
 ```bash
 pythalab-agent chat
-task> Implement solve(x: float) -> float for sin via Taylor series, six terms
-task> exit
 ```
 
-Useful for quickly iterating on small tasks without typing the full `run` command each time.
+Tiny REPL: type a task, press Enter, watch one full `run` cycle, repeat. `Ctrl+D` or `Ctrl+C` exits.
 
-## 4. `pythalab-agent validate`
-
-Run the full validation pipeline against the current `algorithm.py` without writing anything.
+## `validate`
 
 ```bash
-pythalab-agent validate
+pythalab-agent validate [--path PATH]
 ```
 
-Output:
+Runs the validation pipeline (syntax → import → runtime) against the current `algorithm.py` without invoking the model. Useful for CI or for verifying a file you wrote by hand.
 
-```text
- syntax: exit=0
- import: exit=0
- runtime: exit=0
-semantic_score=1.00
-total_score=1.00
-primary_failure=UNKNOWN
-```
+Exit codes: `0` on pass, `1` on any failure. The full report is printed to stdout.
 
-A non-zero exit code on any line indicates a failing gate.
-
-## 5. `pythalab-agent review`
-
-Read-only validation report. Same gates as `validate`, but explicitly does not change files. Useful in CI or pre-commit hooks.
+## `review`
 
 ```bash
-pythalab-agent review
+pythalab-agent review [--path PATH]
 ```
 
-## 6. `pythalab-agent repair`
+Equivalent to `validate`. Provided as a separate verb for CI pipelines that want a non-mutating check name.
 
-Run a single repair pass against the current `algorithm.py`. Useful when validation fails and you want one focused fix attempt without restarting from scratch.
+## `repair`
 
 ```bash
-pythalab-agent repair --task "Fix latest validation failure"
-pythalab-agent repair --backend fake
+pythalab-agent repair [--task TEXT]
 ```
 
-Without `--task` the default repair task is "Fix latest validation failure".
+Shortcut for `run` with a default task ("Fix the failing validators in algorithm.py and produce a passing implementation."). Pass `--task` to override.
 
-## 7. `pythalab-agent doctor`
-
-Print a readiness table:
+## `doctor`
 
 ```bash
 pythalab-agent doctor
 ```
 
-Use this first whenever the agent misbehaves.
+Prints a readiness table for Python, `git`, `ruff`, `pyright`, `pytest`, Ollama, and the configured default / fallback models. See [installation.md](installation.md#5-verify) for what each row means.
 
-## 8. `pythalab-agent models`
-
-```bash
-pythalab-agent models list      # configured default + fallback
-pythalab-agent models doctor    # probe Ollama, verify models exist
-```
-
-To use a different model for one workspace, drop a `configs/models.yaml`:
-
-```yaml
-default_model: qwen3:4b
-fallback_model: qwen3:4b
-base_url: http://localhost:11434
-```
-
-(Only Ollama is supported in 0.1.x.)
-
-## 9. `pythalab-agent config`
+## `config show` / `config doctor`
 
 ```bash
-pythalab-agent config show      # YAML dump of the merged config
-pythalab-agent config doctor    # quick "target_file + default_model" summary
+pythalab-agent config show           # full merged config as YAML
+pythalab-agent config doctor         # workspace + target_file + default_model summary
 ```
 
-The merged configuration is the union of:
+`config show` writes the merged effective configuration (built-in defaults overlaid with `configs/*.yaml`). Use it to confirm a setting actually took effect.
 
-1. Built-in defaults (see [config/defaults.py](../src/pythalab_agent_cli/config/defaults.py)).
-2. `configs/*.yaml` in the workspace root (`default.yaml`, `models.yaml`, `validation.yaml`, `security.yaml`, `prompts.yaml`).
-3. CLI flags.
-
-## 10. `pythalab-agent memory`
-
-The runtime keeps an SQLite memory under `.pythalab-agent/memory.sqlite`.
+## `models list` / `models doctor`
 
 ```bash
-pythalab-agent memory list             # show task records
-pythalab-agent memory clear --yes      # wipe everything
+pythalab-agent models list           # default and fallback names
+pythalab-agent models doctor         # probes Ollama + verifies the names exist
 ```
 
-## 11. Programmatic use
+## `memory list` / `memory clear`
 
-The CLI is a thin wrapper over `pythalab_agent_cli.app.commands`. To embed:
-
-```python
-from pathlib import Path
-from pythalab_agent_cli.app.commands import run_command
-
-result = run_command(
-    repo_root=Path("./my-workspace"),
-    task="Implement solve(n: int) -> int Fibonacci iteratively",
-    backend="ollama",
-    max_attempts=10,
-    until_success=False,
-)
-print(result.status, result.changed_files)
+```bash
+pythalab-agent memory list                 # rows from .pythalab-agent/memory.sqlite
+pythalab-agent memory clear --yes          # truncate the database
 ```
 
-The public Python API surface is intentionally narrow; rely on the CLI for stable behaviour.
-
-## 12. CI integration example
-
-```yaml
-# .github/workflows/check.yml
-name: pythalab-agent validate
-on: [push, pull_request]
-jobs:
-  validate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install -e '.[dev]'
-      - run: pythalab-agent review
-```
-
-`review` requires no Ollama and no model, which makes it safe for headless CI.
+In 0.1.0 the runtime does not persist anything to memory during `run`, so `memory list` returns an empty table immediately after a run. The schema and store are functional and used by the project's own tests; CLI integration of writes is on the roadmap.
